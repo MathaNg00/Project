@@ -1,0 +1,142 @@
+-- All user show: 
+WITH data as (
+Select event_date,event_timestamp, event_name, event_params,event_previous_timestamp, event_value_in_usd, event_server_timestamp_offset, user_id, user_pseudo_id, user_properties, user_first_touch_timestamp, geo, app_info,device
+    From
+      `analytics_294684831.events_*`
+    )
+
+-- event show in_app_purchase: 
+,show_iap AS (
+  SELECT
+    distinct user_pseudo_id,
+    app_info.version,
+    date(timestamp_micros(event_timestamp)) as event_date,
+    TIMESTAMP_MICROS(event_timestamp) AS event_timestamp, -- show_iap_timestamp
+    event_name,
+    geo.country,
+    device.operating_system_version,
+    MAX(IF(param.key='ga_session_id', param.value.int_value,NULL)) AS ga_session_id,
+    MAX(IF(upper(param.key) like '%INAPPSTYLE%', upper(param.value.string_value),NULL)) AS inappstyle_id,
+    MAX(IF(upper(param.key) like '%POSITION%', UPPER(param.value.string_value),NULL)) AS position,
+  FROM data,
+  UNNEST(event_params) AS param
+  WHERE event_name = 'show_iap'
+  GROUP BY 1,2,3,4,5,6,7)
+
+-- event close in_app_purchase: 
+,close_iap AS (
+  SELECT
+    distinct user_pseudo_id,
+    app_info.version,
+    date(timestamp_micros(event_timestamp)) as event_date,
+    TIMESTAMP_MICROS(event_timestamp) AS event_timestamp, -- show_iap_timestamp
+    event_name,
+    geo.country,
+    device.operating_system_version,
+    MAX(IF(param.key='ga_session_id', param.value.int_value,NULL)) AS ga_session_id,
+    MAX(IF(upper(param.key) like '%INAPPSTYLE%', upper(param.value.string_value),NULL)) AS inappstyle_id,
+    MAX(IF(upper(param.key) like '%POSITION%', UPPER(param.value.string_value),NULL)) AS position
+  FROM data,
+  UNNEST(event_params) AS param
+  WHERE event_name in ('close_iap')
+  GROUP BY 1,2,3,4,5,6,7)
+
+-- kết quả thanh toán và số tiền
+, iap_default as ( Select date(timestamp_micros(event_timestamp)) as event_date, user_pseudo_id,
+  MAX(IF(param.key='ga_session_id', param.value.int_value,NULL)) AS ga_session_id
+,MAX(IF(param.key='product_id',upper(replace(substr(param.value.string_value,length("com.cast.stream.totv.home.")+1,100),'.',' ')),NULL)) AS subscription_name
+,event_value_in_usd as price_in_USD,"SUCCESS" as subscription_status
+From `analytics_294684831.events_*`, unnest(event_params) as param
+where event_name = 'in_app_purchase' 
+group by 1,2,5
+)
+,payment_result AS (
+  SELECT
+    distinct user_pseudo_id,
+    app_info.version,
+    date(timestamp_micros(event_timestamp)) as event_date,
+    date_diff(date(timestamp_micros(event_timestamp)),date(TIMESTAMP_MICROS(user_first_touch_timestamp)),DAY)+1 as online_date_count,
+    TIMESTAMP_MICROS(event_timestamp) as event_timestamp,-- iap_result_timestamp
+    geo.country,
+    device.operating_system_version,
+    MAX(IF(param.key='ga_session_id', param.value.int_value,NULL)) AS ga_session_id,
+  
+    event_name,
+    MAX(IF(param.key='product_id',upper(replace(substr(param.value.string_value,length("com.cast.stream.totv.home.")+1,100),'.',' ')),NULL)) AS subscription_name,    
+   
+    case when event_name like '%success%' then 'SUCCESS' else 'FAIL' end AS subscription_status,
+      MAX( IF
+      (upper(param.key)='CUSTOMER_PRICE', param.value.string_value,NULL)) AS price,
+MAX(
+    IF
+      (upper(param.key) like '%INAPPSTYLE%', upper(param.value.string_value),NULL)) AS inappstyle_id,
+    MAX(IF(upper(param.key) like '%POSITION%', UPPER(param.value.string_value),NULL)) AS position
+  FROM data,
+  UNNEST(event_params) AS param
+  WHERE 
+   event_name like 'subscription_%_iap'
+  GROUP BY 1,2,3,4,5,6,7,9
+  
+  )
+
+--lead event payment_result
+,checklist1 as(
+  Select user_pseudo_id,event_name, version, event_date, event_timestamp,country,inappstyle_id,position,ga_session_id
+  From show_iap
+  where ga_session_id is not null
+  union all
+Select user_pseudo_id,event_name, version, event_date, event_timestamp,country,inappstyle_id,position,ga_session_id
+From payment_result
+where ga_session_id is not null
+)
+
+--lead next payment event
+,lead_next_event as(
+  Select *
+  From
+  (Select user_pseudo_id,
+  case when upper(event_name) like '%FAIL%' and upper(lead_event_name_1) like '%SUCCESS%' then "show_iap" else event_name end as event_name ,
+  event_timestamp, version,ga_session_id, event_date,event_timestamp as pre_event_timestamp,country,inappstyle_id,position,
+  case when lead_event_name_1 like  'subscription_%_iap' then lead_event_name_1 else null end as lead_event_name_1
+  ,lead_event_timestamp_1
+  From (Select user_pseudo_id,event_name , version,ga_session_id, event_date,event_timestamp,country,inappstyle_id,position,
+      lead(event_name) over(partition by user_pseudo_id,country,inappstyle_id,position,event_date,ga_session_id order by event_timestamp) as lead_event_name_1,
+      lead(event_timestamp) over(partition by user_pseudo_id,country,inappstyle_id,position,event_date,ga_session_id order by event_timestamp) as lead_event_timestamp_1
+From checklist1
+order by user_pseudo_id , event_timestamp)) where event_name = 'show_iap' )
+
+--check list với event close_iap
+,checklist2 as(
+  Select user_pseudo_id,event_name, version, event_date, event_timestamp,country,inappstyle_id,position,ga_session_id,
+  null as lead_event_name_1, null as lead_event_timestamp_1
+From close_iap
+where ga_session_id is not null
+union all
+Select user_pseudo_id,event_name, version, event_date, event_timestamp,country,inappstyle_id,position,ga_session_id,
+lead_event_name_1,lead_event_timestamp_1
+From lead_next_event
+where ga_session_id is not null
+)
+,lead_next_event2 as(
+  Select *
+  From (Select user_pseudo_id,event_name , version,ga_session_id, event_date,event_timestamp,country,inappstyle_id,position,lead_event_name_1,lead_event_timestamp_1,
+      lead(event_name) over(partition by user_pseudo_id,country,inappstyle_id,position,event_date,ga_session_id order by event_timestamp) as lead_event_name_2,
+      lead(event_timestamp) over(partition by user_pseudo_id,country,inappstyle_id,position,event_date,ga_session_id order by event_timestamp) as lead_event_timestamp_2
+From checklist2
+order by user_pseudo_id , event_timestamp) where event_name = 'show_iap')
+
+-- show kết 
+,final_list as (
+Select user_pseudo_id,event_name as previous_event,event_timestamp as pre_event_timestamp, version,ga_session_id, event_date,country,inappstyle_id,position,
+  coalesce(lead_event_name_1,lead_event_name_2,null) as event_name,
+  coalesce(lead_event_timestamp_1,lead_event_timestamp_2,null) as event_timestamp
+ from lead_next_event2 --using(user_pseudo_id,event_name , version,ga_session_id, event_date,event_timestamp,country,inappstyle_id,position)
+)
+
+Select *,Row_number() over(partition by user_pseudo_id, event_date order by show_iap_timestamp asc) as iap_impression_count
+From
+(Select distinct user_pseudo_id,previous_event, version,ga_session_id, event_date,pre_event_timestamp as show_iap_timestamp,country,inappstyle_id,position,case when event_name is null or event_name = 'show_iap' then 'Close App' else event_name end as result_name,event_timestamp as result_timestamp,subscription_name,subscription_status,price_in_USD as USD_price,price as customer_price,online_date_count,
+abs(timestamp_diff(event_timestamp,pre_event_timestamp,second)) as result_time_count
+From final_list
+left join payment_result using(user_pseudo_id,event_name, version,ga_session_id, event_date,event_timestamp,country,inappstyle_id,position)
+left join iap_default using(event_date,user_pseudo_id,ga_session_id, subscription_name,subscription_status))
