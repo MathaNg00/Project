@@ -1,0 +1,73 @@
+        with click_tv as (
+    SELECT distinct user_pseudo_id,version,country,event_date, event_timestamp,event_name,ga_session_id, CONNECT_BY_MODEL_NAME,
+            CONNECT_BY_FRIENDLY_NAME,
+            CONNECT_BY_SERVICE,tv_operating_system,
+            tv_brand, 
+            Case when event_name = 'click_switch_connect_tv_cs' then  "SWITCH_TV"
+            else "CLICK_TV" end as type
+    FROM `bi_optimum.event_with_user_type`
+, unnest(event_params) as param
+    where event_name in('click_connect_tv_cs','click_switch_connect_tv_cs') and ga_session_id is not null
+    ),
+connect_result as (
+        SELECT distinct user_pseudo_id,version,country,event_date,event_timestamp ,event_name, 
+        case   when upper(event_name) like '%FAIL%'then 'CONNECT FAIL'
+        when upper(event_name) like '%SUCCESS%'then 'CONNECT SUCCESS'
+        end as type
+        ,ga_session_id,tv_brand,tv_operating_system,
+                 CONNECT_BY_MODEL_NAME,
+                 CONNECT_BY_FRIENDLY_NAME,
+                CONNECT_BY_SERVICE,
+        FROM `bi_optimum.event_with_user_type`
+, unnest(event_params) as param
+        where event_name in ('connect_tv_success_cs','connect_tv_fail_cs', 'connect_event_fail', 'connect_event_success') and ga_session_id is not null
+        )
+,checklist as (
+Select distinct event_date,event_name,user_pseudo_id,event_timestamp,CONNECT_BY_MODEL_NAME,CONNECT_BY_FRIENDLY_NAME,CONNECT_BY_SERVICE,type,ga_session_id,tv_brand,tv_operating_system,version,country
+from connect_result
+union all 
+Select distinct event_date,event_name,user_pseudo_id,event_timestamp,CONNECT_BY_MODEL_NAME,CONNECT_BY_FRIENDLY_NAME,CONNECT_BY_SERVICE,type,ga_session_id,tv_brand,tv_operating_system,version,country
+from click_tv
+where ga_session_id is not null
+)
+
+--lấy kết quả event
+,dieukien as(
+  Select event_date,user_pseudo_id,version,event_timestamp,--đây là timestamp event success
+        CONNECT_BY_MODEL_NAME,CONNECT_BY_FRIENDLY_NAME,CONNECT_BY_SERVICE,tv_brand ,ga_session_id,
+        case when lag_type = 'CLICK_TV' and lag_type_1 = 'SWITCH_TV' then "SWITCH_TV"
+        else lag_type end as event_click,event_name,
+  Case when type = lag_type and type = 'CLICK_TV' then 'NO RESPONSE'
+  when lag_type in  ('CLICK_TV','SWITCH_TV')  and type is null
+  then "UNDEFINED" 
+  else type end as click_result
+  
+  ,lag_event_timestamp,tv_operating_system,
+  timestamp_diff((event_timestamp),(lag_event_timestamp), millisecond) as time_spend_by_millisecond,
+   timestamp_diff((event_timestamp),(lag_event_timestamp), second) as time_spend_by_second
+from
+(
+        Select event_date,user_pseudo_id,event_timestamp,version,country,event_name,
+        CONNECT_BY_MODEL_NAME,CONNECT_BY_FRIENDLY_NAME,CONNECT_BY_SERVICE,tv_brand ,tv_operating_system,
+        type,ga_session_id,
+        lag(type) over(partition by user_pseudo_id,event_date,ga_session_id order by event_timestamp) as lag_type,
+        lag(event_timestamp) over(partition by user_pseudo_id,event_date,ga_session_id order by event_timestamp) as lag_event_timestamp,
+        lag(tv_brand) over(partition by user_pseudo_id,event_date,ga_session_id order by event_timestamp) as lag_tv_brand,
+        lag(type,2) over(partition by user_pseudo_id,event_date,ga_session_id order by event_timestamp) as lag_type_1,
+from checklist
+)
+where lag_event_timestamp<=event_timestamp 
+and tv_brand = lag_tv_brand and upper(lag_type) like "%TV%" and upper(type) != 'SWITCH_TV')
+
+
+Select distinct event_date, ga_session_id, user_pseudo_id,version,lag_event_timestamp as click_timestamp,event_click,
+case when click_result ='CLICK_TV' then 'NO RESPONSE' else click_result end as click_result ,tv_operating_system,
+        CONNECT_BY_MODEL_NAME,CONNECT_BY_FRIENDLY_NAME,CONNECT_BY_SERVICE, tv_brand,lag_event_timestamp as result_timestamp,
+        rank() over(partition by user_pseudo_id, event_date,ga_session_id,CONNECT_BY_FRIENDLY_NAME,tv_brand,event_click order by event_timestamp) as tv_connect_time,
+        time_spend_by_second
+From dieukien
+where ga_session_id is not null and 
+        case event_click when 'CLICK_TV' then time_spend_by_millisecond between 900 and 30000 --khoảng 0.9 giây
+        when 'SWITCH_TV' then time_spend_by_millisecond between 1500 and 30000 end --do có phần bấm switch, có thể mất đến 1.5 giây
+
+order by user_pseudo_id,event_date,click_timestamp 
